@@ -333,7 +333,13 @@ _PROMPT_FALLBACK_LIMIT = 12000
 # (measured: ~10s to first token, of which 7s was this sleep). We now poll for
 # readiness with WARM_MIN as a hard floor and WARM_MAX as the deadline, which
 # keeps the anti-ban guarantee but lets a fast page skip straight to ready.
-WARM_MIN = float(os.getenv("DUCKAI_WARM_MIN", "2.0"))
+#
+# WARM_MIN=1.0 (2026-11-13): live probes sent successfully at 1.5s page age
+# with valid replies and no ERR_BN_LIMIT/ERR_CHALLENGE - the textarea only
+# appears once the challenge JS is up (~2.0s load), so the effective gate is
+# textarea presence, not the floor. Set env DUCKAI_WARM_MIN back to 2.0 if a
+# deploy ever sees challenge errors.
+WARM_MIN = float(os.getenv("DUCKAI_WARM_MIN", "1.0"))
 WARM_MAX = float(os.getenv("DUCKAI_WARM_MAX", "7.0"))
 
 # Launch Chrome and warm a page at server startup instead of on first request.
@@ -347,6 +353,9 @@ PREWARM = os.getenv("DUCKAI_PREWARM", "1") not in ("0", "false", "False")
 # current request streams. Costs one extra Chrome tab (~100-150MB) - set
 # DUCKAI_STANDBY=0 on memory-tight boxes.
 STANDBY = os.getenv("DUCKAI_STANDBY", "1") not in ("0", "false", "False")
+# Number of hot spares. Two keeps back-to-back fresh prompts (client retries,
+# parallel IDE calls) off the cold path entirely.
+STANDBY_COUNT = int(os.getenv("DUCKAI_STANDBY_COUNT", "2"))
 
 
 def _clamp_prompt(prompt: str, limit: int) -> str:
@@ -380,10 +389,12 @@ class _BrowserSession:
         # The reused page holds live conversation state, so only one send may drive
         # it at a time; concurrent clients queue instead of clobbering each other.
         self._lock = asyncio.Lock()
-        # Hot spare: a fully-warmed tab taken instantly by the next fresh-prompt
-        # request, refilled in the background while that request streams.
-        self._standby_page = None
-        self._standby_task: Optional[asyncio.Task] = None
+        # Hot spares: fully-warmed tabs taken instantly by fresh-prompt
+        # requests, refilled in the background while that request streams.
+        # Two spares back-to-back bursts (client retries, parallel IDE calls)
+        # from ever falling back to the cold open+warm path.
+        self._standby_pages: List[Any] = []
+        self._standby_tasks: List[asyncio.Task] = []
 
     async def _ensure_ready(self) -> None:
         if self._ready:
@@ -457,8 +468,8 @@ class _BrowserSession:
         replacement warm in the background.
         """
         await self._ensure_ready()
-        if self._standby_page is not None:
-            page, self._standby_page = self._standby_page, None
+        if self._standby_pages:
+            page = self._standby_pages.pop(0)
             self._page_opened_at = asyncio.get_event_loop().time()
         else:
             page = await self.ctx.new_page()
@@ -471,41 +482,50 @@ class _BrowserSession:
         return page
 
     async def _warm_standby(self) -> None:
-        """Warm one spare tab into _standby_page (best-effort, never raises)."""
-        if self._pw is None or self._standby_page is not None:
+        """Warm one spare tab onto _standby_pages (best-effort, never raises)."""
+        if self._pw is None:
             return
         try:
             page = await self.ctx.new_page()
             await page.goto(BASE, wait_until="domcontentloaded", timeout=60000)
-            await self._wait_warm(page)
-            self._standby_page = page
+            opened_at = asyncio.get_event_loop().time()
+            # Warm against the page's own open time, not the session's: with
+            # multiple spares each tab must independently satisfy WARM_MIN.
+            await self._wait_warm(page, page_opened_at=opened_at)
+            self._standby_pages.append(page)
         except Exception as e:  # noqa: BLE001 - standby is pure optimization
             logger.warning("standby warm skipped: %s", e)
 
     def _refill_standby(self) -> None:
         if not STANDBY or self._pw is None:
             return
-        if self._standby_task is None or self._standby_task.done():
-            self._standby_task = asyncio.get_event_loop().create_task(self._warm_standby())
+        self._standby_tasks = [t for t in self._standby_tasks if not t.done()]
+        while len(self._standby_pages) + len(self._standby_tasks) < STANDBY_COUNT:
+            self._standby_tasks.append(
+                asyncio.get_event_loop().create_task(self._warm_standby()))
 
-    async def _wait_warm(self, page, budget: float = 7.0) -> None:
+    async def _wait_warm(self, page, budget: float = 7.0, page_opened_at: Optional[float] = None) -> None:
         """Block until the page looks ready to send, capped at `budget` seconds.
 
         Readiness signal: the composer textarea exists AND the page has been up
         for at least WARM_MIN seconds - Duck.ai refuses an instant send while
         its challenge JS is still booting. Falls back to the full budget if the
         probe never goes green, so behaviour can never get WORSE than before.
+
+        `page_opened_at` overrides the session's open timestamp: standby tabs
+        each track their own load clock so several can warm concurrently.
         """
         loop = asyncio.get_event_loop()
+        opened = self._page_opened_at if page_opened_at is None else page_opened_at
         deadline = loop.time() + budget
         while loop.time() < deadline:
-            if loop.time() - self._page_opened_at >= WARM_MIN:
+            if loop.time() - opened >= WARM_MIN:
                 try:
                     if await page.query_selector("textarea") is not None:
                         return
                 except Exception:
                     return
-            await page.wait_for_timeout(200)
+            await page.wait_for_timeout(100)
 
     def _continuation(self, prompt: str) -> Optional[str]:
         """Text to type when `prompt` only ADDS one turn to the live conversation.
@@ -594,12 +614,15 @@ class _BrowserSession:
             if target is None:
                 raise DuckAIError("duck.ai file input not found (page layout changed)")
             await target.set_input_files([u["name"] for u in uploads])
-            # Give the app a beat to build thumbnails / flip Send enabled.
+            # Give the app a beat to build thumbnails / flip Send enabled: a
+            # thumbnail chip appearing next to the composer is the readiness
+            # signal; cap at 2s (thumbnails are local, this is near-instant).
             for _ in range(20):
-                await page.wait_for_timeout(200)
-                ta = await page.query_selector("textarea")
-                if ta is None:
+                await page.wait_for_timeout(100)
+                chips = await page.query_selector_all("[class*='thumbnail'], [class*='attachment'], img[src^='blob:']")
+                if chips:
                     break
+            await page.wait_for_timeout(150)
             logger.info("attached %d file(s) to duck.ai composer", len(uploads))
         finally:
             for u in uploads:
@@ -778,14 +801,15 @@ class _BrowserSession:
         raise DuckAIError(f"Duck.ai error: {typ}")
 
     async def close(self) -> None:
-        if self._standby_task is not None:
-            self._standby_task.cancel()
-        if self._standby_page is not None:
+        for t in self._standby_tasks:
+            t.cancel()
+        for p in self._standby_pages:
             try:
-                await self._standby_page.close()
+                await p.close()
             except Exception:
                 pass
-            self._standby_page = None
+        self._standby_tasks = []
+        self._standby_pages = []
         try:
             if self.browser:
                 await self.browser.close()

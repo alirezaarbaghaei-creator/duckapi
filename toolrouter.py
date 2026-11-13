@@ -40,6 +40,32 @@ KNOWN_TOOLS = {
     "WebFetch",
 }
 
+# Generic tool names web agent UIs (Z.ai, WorkBuddy, ...) wrap the same
+# operations in. Mapped onto the built-in intent extractors below, so a client
+# offering `shell`/`execute_command` gets routed exactly like `Bash`.
+_TOOL_ALIASES = {
+    "shell": "Bash",
+    "run_command": "Bash",
+    "execute_command": "Bash",
+    "terminal": "Bash",
+    "run_terminal_cmd": "Bash",
+    "read_file": "Read",
+    "view_file": "Read",
+    "open_file": "Read",
+    "write_file": "Write",
+    "create_file": "Write",
+    "edit_file": "Edit",
+    "apply_diff": "Edit",
+    "search_files": "Grep",
+    "search_code": "Grep",
+    "list_files": "Glob",
+    "list_dir": "Glob",
+    "fetch_url": "WebFetch",
+    "open_url": "WebFetch",
+    "browser_visit": "WebFetch",
+    "web_search": "WebFetch",
+}
+
 
 @dataclass
 class RoutedToolCall:
@@ -183,6 +209,11 @@ def route_intent(messages: List[dict], tools: List[dict]) -> Optional[RoutedTool
             name = t.get("name")
         if name:
             client_tool_names.add(name)
+    # Alias map: a client tool named `read_file` routes via the Read extractor
+    # but RETURNS the client's own name, so the agent recognises the call.
+    effective = {}
+    for n in client_tool_names:
+        effective[n] = _TOOL_ALIASES.get(n, n)
 
     text = _last_user_text(messages)
     if not text.strip():
@@ -191,11 +222,16 @@ def route_intent(messages: List[dict], tools: List[dict]) -> Optional[RoutedTool
     # Try known tools in priority order (Bash last so Read/Glob win on overlap).
     order = ["Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "Bash"]
     for name in order:
-        if name not in client_tool_names or name not in _INTENTS:
+        if name not in _INTENTS:
+            continue
+        if name not in effective.values():
             continue
         args = _INTENTS[name](text)
         if args:
-            return RoutedToolCall(name=name, input=args)
+            # Reply with the client's tool name (alias back), not the built-in.
+            for orig, canon in effective.items():
+                if canon == name:
+                    return RoutedToolCall(name=orig, input=args)
     return None
 
 

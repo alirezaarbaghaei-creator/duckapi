@@ -42,10 +42,12 @@ Model catalog (live /duckchat/v1/models snapshot 2026-09-19) + alias map follow.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+import tempfile
 import urllib.request
 from typing import AsyncIterator, List, Optional
 
@@ -511,11 +513,69 @@ class _BrowserSession:
         if not sent:
             await ta.press("Enter")
 
-    async def _iter_events(self, prompt: str, timeout: float, rewrite: Optional[dict]) -> AsyncIterator[dict]:
+    # duck.ai's hidden file input accepts exactly these (probed live 2026-11).
+    _ATTACH_MIMES = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "application/pdf": ".pdf",
+    }
+
+    async def _attach_files(self, page, files: List[dict]) -> None:
+        """Attach image/PDF bytes to the composer via duck.ai's hidden file input.
+
+        `files` is a list of {data: bytes, mime: str}. The input is hidden but a
+        real <input type=file>, so Playwright's set_input_files drives the app's
+        own upload path (thumbnail preview, request framing) exactly like a
+        manual pick - no fetch crafting, no challenge break.
+        """
+        if not files:
+            return
+        uploads: List[dict] = []
+        for f in files:
+            ext = self._ATTACH_MIMES.get(f["mime"])
+            if ext is None:
+                raise DuckAIError(f"unsupported attachment type: {f['mime']}")
+            fh = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            try:
+                fh.write(f["data"])
+                fh.close()
+                uploads.append({"name": fh.name, "mime": f["mime"]})
+            except Exception:
+                fh.close()
+                raise
+        try:
+            # Last input[type=file] wins: duck.ai renders exactly one upload
+            # input per composer; querying all keeps us safe against duplicates.
+            inputs = await page.query_selector_all("input[type=file]")
+            target = inputs[-1] if inputs else None
+            if target is None:
+                raise DuckAIError("duck.ai file input not found (page layout changed)")
+            await target.set_input_files([u["name"] for u in uploads])
+            # Give the app a beat to build thumbnails / flip Send enabled.
+            for _ in range(20):
+                await page.wait_for_timeout(200)
+                ta = await page.query_selector("textarea")
+                if ta is None:
+                    break
+            logger.info("attached %d file(s) to duck.ai composer", len(uploads))
+        finally:
+            for u in uploads:
+                try:
+                    os.unlink(u["name"])
+                except OSError:
+                    pass
+
+    async def _iter_events(self, prompt: str, timeout: float, rewrite: Optional[dict],
+                           attachments: Optional[List[dict]] = None) -> AsyncIterator[dict]:
         global _REWRITE_OK
         page_alive = self.page is not None and not self.page.is_closed()
         text = None
-        if page_alive and not self.new_chat:
+        # Attachments always force a fresh page: the continuation fast-path only
+        # types a delta into the existing composer, which would leave the files
+        # behind - vision turns must go through the full upload+send path.
+        if page_alive and not self.new_chat and not attachments:
             text = self._continuation(prompt)
         if text is None:
             if page_alive:
@@ -527,6 +587,8 @@ class _BrowserSession:
 
         await page.evaluate(_RESET_JS, rewrite if (rewrite and _REWRITE_OK) else None)
         try:
+            if attachments:
+                await self._attach_files(page, attachments)
             await self._trigger_send(page, text)
         except Exception:
             await self._drop_page()
@@ -574,17 +636,19 @@ class _BrowserSession:
         await self._drop_page()
         raise DuckAIError("timed out waiting for Duck.ai reply")
 
-    async def send_stream_ui(self, prompt: str, timeout: float = 120.0, rewrite: Optional[dict] = None) -> AsyncIterator[str]:
+    async def send_stream_ui(self, prompt: str, timeout: float = 120.0, rewrite: Optional[dict] = None,
+                             attachments: Optional[List[dict]] = None) -> AsyncIterator[str]:
         """Drive the real UI to send, then stream the reply token-by-token.
 
         Reuses the live page when the request continues the previous conversation;
         otherwise opens a fresh warmed page and re-sends the full flattened prompt
         (Duck.ai is a one-textarea chat; history must arrive in the body).
+        `attachments` ({data, mime} list) rides the app's own file-upload path.
         """
         for attempt in (0, 1):
             try:
                 async with self._lock:
-                    async for ev in self._iter_events(prompt, timeout, rewrite):
+                    async for ev in self._iter_events(prompt, timeout, rewrite, attachments):
                         msg = ev.get("message")
                         if msg:
                             yield msg
@@ -594,15 +658,17 @@ class _BrowserSession:
                     continue
                 raise
 
-    async def send_ui(self, prompt: str, timeout: float = 120.0, rewrite: Optional[dict] = None) -> str:
+    async def send_ui(self, prompt: str, timeout: float = 120.0, rewrite: Optional[dict] = None,
+                      attachments: Optional[List[dict]] = None) -> str:
         parts: List[str] = []
-        async for tok in self.send_stream_ui(prompt, timeout, rewrite):
+        async for tok in self.send_stream_ui(prompt, timeout, rewrite, attachments):
             parts.append(tok)
         return "".join(parts)
 
     _IMAGE_INSTRUCTION = (
-        "请直接调用图像生成工具，根据以下描述生成一张图片，不要反问、不要解释过程。"
-        "图像描述：{prompt}{size_hint}"
+        "Call the image generation tool directly and generate one image from the "
+        "description below. Do not ask questions, do not explain the process. "
+        "Image description: {prompt}{size_hint}"
     )
 
     async def send_image_ui(
@@ -624,7 +690,7 @@ class _BrowserSession:
             dims = re.split(r"[x×]", str(size))
             try:
                 w, h = int(dims[0]), int(dims[1])
-                hint = "（构图：横版宽幅）" if w > h else "（构图：竖版）" if h > w else "（构图：方形）"
+                hint = " (composition: wide landscape)" if w > h else " (composition: portrait)" if h > w else " (composition: square)"
             except (ValueError, IndexError):
                 pass
         instruction = self._IMAGE_INSTRUCTION.format(prompt=prompt, size_hint=hint)
@@ -753,14 +819,15 @@ class DuckAISession:
         except Exception as e:
             logger.warning("prewarm failed (%s); serving lazily instead", e)
 
-    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> str:
+    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2,
+                   attachments: Optional[List[dict]] = None) -> str:
         last_err: Optional[Exception] = None
         for _ in range(max(1, max_rotations)):
             idx = self._next_proxy_index()
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
             try:
-                return await (await self._session_for(idx)).send_ui(prompt, self.timeout, rewrite)
+                return await (await self._session_for(idx)).send_ui(prompt, self.timeout, rewrite, attachments)
             except DuckAIRateLimit as e:
                 last_err = e
                 self._sessions.get(idx).banned = True
@@ -772,7 +839,8 @@ class DuckAISession:
                 raise DuckAIError(f"browser transport failed: {e}")
         raise last_err or DuckAIRateLimit("all sessions failed")
 
-    async def send_stream(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> AsyncIterator[str]:
+    async def send_stream(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2,
+                          attachments: Optional[List[dict]] = None) -> AsyncIterator[str]:
         """Stream the assistant reply token-by-token (real incremental SSE)."""
         last_err: Optional[Exception] = None
         for _ in range(max(1, max_rotations)):
@@ -780,7 +848,7 @@ class DuckAISession:
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
             try:
-                async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite):
+                async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite, attachments):
                     yield tok
                 return
             except DuckAIRateLimit as e:

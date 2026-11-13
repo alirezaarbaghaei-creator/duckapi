@@ -27,10 +27,14 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
+import re
 import time
+import urllib.request
 from collections import deque
 from typing import Any, List, Optional, Union
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -108,6 +112,22 @@ def _created() -> int:
     return int(time.time())
 
 
+def _est_tokens(text: Any) -> int:
+    """Rough token estimate (~4 chars/token English, worse for CJK/RTL).
+
+    OpenAI-compatible clients (LiteLLM, langchain, cost trackers) read usage;
+    zeros satisfy the schema but break budget math. This is honest enough:
+    labeled an estimate, never claimed exact.
+    """
+    if not text:
+        return 0
+    if isinstance(text, (bytes, bytearray)):
+        s = text.decode("latin-1", errors="replace")
+    else:
+        s = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    return max(1, (len(s) + 3) // 4)
+
+
 # resolve_model is imported from duckai (single source of truth for model mapping).
 
 
@@ -155,6 +175,112 @@ def _anthropic_block_text(content: Any) -> str:
 
 def _role_label(role: str) -> str:
     return {"user": "Human", "assistant": "Assistant", "system": "System"}.get(role, "Human")
+
+
+# ---------------------------------------------------------------------------
+# Vision attachments (OpenAI image_url / Anthropic image / Responses input_image)
+# ---------------------------------------------------------------------------
+# duck.ai's composer accepts png/jpeg/webp/gif (+pdf) per its hidden file input.
+_VISION_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+_MAX_ATTACHMENTS = 4
+_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024  # duck.ai UI limit (observed); be safe
+_DATA_URL_RE = re.compile(r"^data:(?P<mime>[a-zA-Z0-9/+.-]+);base64,(?P<b64>[A-Za-z0-9+/=\s]+)$")
+
+
+def _decode_attachment(source: str) -> dict:
+    """Turn an image reference into {data, mime} for the browser upload.
+
+    Accepts a `data:` URL (preferred: no outbound fetch, no privacy leak) or an
+    https URL fetched with the page's normal UA. http:// URLs are rejected:
+    downgrading a browser session's traffic to plaintext buys nothing.
+    """
+    source = source.strip()
+    m = _DATA_URL_RE.match(source)
+    if m:
+        mime = m.group("mime").lower()
+        if mime not in _VISION_MIMES:
+            raise HTTPException(status_code=400,
+                                detail=f"unsupported image type {mime} (allowed: {', '.join(sorted(_VISION_MIMES))})")
+        try:
+            raw = base64.b64decode(m.group("b64"), validate=False)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid base64 in data URL")
+        return _check_attachment(raw, mime)
+    parsed = urlparse(source)
+    if parsed.scheme == "https":
+        mime, _ = mimetypes.guess_type(parsed.path or "")
+        mime = (mime or "image/jpeg").lower()
+        if mime not in _VISION_MIMES:
+            # Some CDNs serve images as application/octet-stream; sniff magic bytes.
+            mime = "image/png"
+        try:
+            req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read(16 * 1024 * 1024 + 1)
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not fetch image url: {e}")
+        if ctype in _VISION_MIMES:
+            mime = ctype
+        return _check_attachment(raw, mime)
+    raise HTTPException(status_code=400, detail="image_url must be a data: URL or an https:// URL")
+
+
+def _check_attachment(raw: bytes, mime: str) -> dict:
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="empty image payload")
+    if len(raw) > _MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=400,
+                            detail=f"image too large ({len(raw)} bytes; limit {_MAX_ATTACHMENT_BYTES})")
+    return {"data": raw, "mime": mime}
+
+
+def extract_attachments(content: Any) -> List[dict]:
+    """Pull every image out of one message's content field.
+
+    Understands all three wire shapes clients actually send:
+      - OpenAI chat:   {"type": "image_url", "image_url": {"url": ...}}
+      - Anthropic:     {"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}
+                       {"type": "image", "source": {"type": "url", "url": ...}}
+      - Responses API: {"type": "input_image", "image_url": "..."} (str or {url})
+    Non-image blocks are ignored here; text flows through the normal flatteners.
+    """
+    out: List[dict] = []
+    if not isinstance(content, list):
+        return out
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        try:
+            if btype == "image_url":
+                iu = block.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if isinstance(url, str) and url:
+                    out.append(_decode_attachment(url))
+            elif btype == "image":
+                src = block.get("source") or {}
+                if src.get("type") == "base64":
+                    mime = str(src.get("media_type", "image/png")).lower()
+                    if mime not in _VISION_MIMES:
+                        raise HTTPException(status_code=400,
+                                            detail=f"unsupported image type {mime} (allowed: {', '.join(sorted(_VISION_MIMES))})")
+                    raw = base64.b64decode(str(src.get("data", "")))
+                    out.append(_check_attachment(raw, mime))
+                elif src.get("type") == "url":
+                    out.append(_decode_attachment(str(src.get("url", ""))))
+            elif btype == "input_image":
+                iu = block.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if isinstance(url, str) and url:
+                    out.append(_decode_attachment(url))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"bad image block: {e}")
+        if len(out) >= _MAX_ATTACHMENTS:
+            break
+    return out[:_MAX_ATTACHMENTS]
 
 
 def flatten_conversation(system: Any, messages: List[dict]) -> str:
@@ -400,7 +526,8 @@ class ChatCompletionRequest(BaseModel):
     duckai: Optional[dict] = None
 
 
-async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None):
+async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_id: str,
+                         rewrite: Optional[dict] = None, attachments: Optional[List[dict]] = None):
     def chunk_obj(delta: dict, finish):
         return {
             "id": chat_id,
@@ -413,7 +540,7 @@ async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_i
     try:
         # Strict OpenAI clients expect the first chunk's delta to carry role.
         yield f"data: {json.dumps(chunk_obj({'role': 'assistant', 'content': ''}, None))}\n\n"
-        async for token in session.send_stream(prompt, rewrite=rewrite):
+        async for token in session.send_stream(prompt, rewrite=rewrite, attachments=attachments):
             yield f"data: {json.dumps(chunk_obj({'content': token}, None))}\n\n"
         yield f"data: {json.dumps(chunk_obj({}, 'stop'))}\n\n"
         yield "data: [DONE]\n\n"
@@ -428,14 +555,23 @@ async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_i
 async def chat_completions(request: ChatCompletionRequest):
     system = None
     turns = []
+    attachments: List[dict] = []
     for m in request.messages:
         if m.role == "system":
             system = m.content
         else:
             turns.append({"role": m.role, "content": m.content})
+            # OpenAI vision: images ride in the message content blocks. duck.ai
+            # gets only the LAST user turn's images (its UI attaches files to a
+            # single send, not to history turns).
+            if m.role == "user":
+                for att in extract_attachments(m.content):
+                    attachments.append(att)
     prompt = flatten_conversation(system, turns)
-    if not prompt.strip() and not request.tools:
+    if not prompt.strip() and not attachments and not request.tools:
         raise HTTPException(status_code=400, detail="empty prompt")
+    if len(attachments) > _MAX_ATTACHMENTS:
+        raise HTTPException(status_code=400, detail=f"too many images (limit {_MAX_ATTACHMENTS})")
     model = resolve_model(request.model)
 
     def _tname(t: dict) -> str:
@@ -483,11 +619,11 @@ async def chat_completions(request: ChatCompletionRequest):
 
     if request.stream:
         return StreamingResponse(
-            _openai_stream(session, prompt, model, _id(), rewrite), media_type="text/event-stream"
+            _openai_stream(session, prompt, model, _id(), rewrite, attachments), media_type="text/event-stream"
         )
 
     try:
-        result = await session.send(prompt, rewrite=rewrite)
+        result = await session.send(prompt, rewrite=rewrite, attachments=attachments)
     except DuckAIRateLimit as e:
         raise HTTPException(status_code=429, detail=str(e))
     except DuckAIError as e:
@@ -503,13 +639,15 @@ async def chat_completions(request: ChatCompletionRequest):
             "function": {"name": tc.name, "arguments": json.dumps(tc.input, ensure_ascii=False)},
         }]
         finish = "tool_calls"
+    ptoks = _est_tokens(prompt) + sum(_est_tokens(a["data"]) // 1000 for a in attachments)
+    ctoks = _est_tokens(result)
     return {
         "id": _id(),
         "object": "chat.completion",
         "created": _created(),
         "model": model,
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {"prompt_tokens": ptoks, "completion_tokens": ctoks, "total_tokens": ptoks + ctoks},
     }
 
 
@@ -550,6 +688,20 @@ async def openai_responses(request: Request):
     model = resolve_model(raw.get("model"))
     tools = raw.get("tools") or []
     prompt = _responses_input_text(raw.get("input"))
+    # Responses API vision: `input_image` items ride alongside text items in the
+    # input list; collect them for the composer upload like chat.completions.
+    attachments: List[dict] = []
+    inp = raw.get("input")
+    if isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, dict):
+                for att in extract_attachments(item.get("content") if item.get("type") != "input_image" else None):
+                    attachments.append(att)
+                if item.get("type") == "input_image":
+                    for att in extract_attachments([item]):
+                        attachments.append(att)
+        if len(attachments) > _MAX_ATTACHMENTS:
+            raise HTTPException(status_code=400, detail=f"too many images (limit {_MAX_ATTACHMENTS})")
     # Relay-side tool routing: synthesise a function_call from the user's intent.
     if TOOL_ROUTING and tools:
         resp_items = raw.get("input") or []
@@ -581,7 +733,7 @@ async def openai_responses(request: Request):
                     }],
                     "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                 }
-    if not prompt:
+    if not prompt and not attachments:
         raise HTTPException(status_code=400, detail="empty input")
     stream = bool(raw.get("stream", False))
     session = await get_session(model)
@@ -595,7 +747,7 @@ async def openai_responses(request: Request):
 
     if not stream:
         try:
-            result = await session.send(prompt, rewrite=rewrite)
+            result = await session.send(prompt, rewrite=rewrite, attachments=attachments)
         except DuckAIRateLimit as e:
             raise HTTPException(status_code=429, detail=str(e))
         except DuckAIError as e:
@@ -636,7 +788,7 @@ async def openai_responses(request: Request):
     async def _resp_stream():
         yield f"data: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'status': 'in_progress', 'model': model, 'output': []}})}\n\n"
         try:
-            async for token in session.send_stream(prompt, rewrite=rewrite):
+            async for token in session.send_stream(prompt, rewrite=rewrite, attachments=attachments):
                 yield f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': token})}\n\n"
         except (DuckAIRateLimit, DuckAIError) as e:
             yield f"data: {json.dumps({'type': 'error', 'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
@@ -756,6 +908,14 @@ async def anthropic_messages(request: Request):
     tools = raw.get("tools") or []
     messages = raw.get("messages") or []
     prompt = build_anthropic_prompt(system, messages)
+    # Anthropic vision: {"type":"image","source":{"type":"base64"|"url",...}} blocks.
+    attachments: List[dict] = []
+    for m in messages:
+        if m.get("role") == "user":
+            for att in extract_attachments(m.get("content")):
+                attachments.append(att)
+    if len(attachments) > _MAX_ATTACHMENTS:
+        raise HTTPException(status_code=400, detail=f"too many images (limit {_MAX_ATTACHMENTS})")
     # Relay-side tool routing: Duck.ai cannot emit tool calls, so the relay
     # synthesizes a tool_use block from the user's intent. Skip routing when the
     # client is already returning a tool_result (mid-loop) - then we just answer.
@@ -776,7 +936,7 @@ async def anthropic_messages(request: Request):
     msg_id = f"msg_{uuid4().hex[:24]}"
     if not stream:
         try:
-            result = await session.send(prompt, rewrite=rewrite)
+            result = await session.send(prompt, rewrite=rewrite, attachments=attachments)
         except DuckAIRateLimit as e:
             return _anthropic_error(429, "rate_limit_error", str(e))
         except DuckAIError as e:
@@ -803,7 +963,7 @@ async def anthropic_messages(request: Request):
             "content_block": {"type": "text", "text": ""},
         })
         try:
-            async for token in session.send_stream(prompt, rewrite=rewrite):
+            async for token in session.send_stream(prompt, rewrite=rewrite, attachments=attachments):
                 yield _sse("content_block_delta", {
                     "type": "content_block_delta",
                     "index": 0,

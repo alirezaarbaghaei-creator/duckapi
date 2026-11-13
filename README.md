@@ -405,21 +405,31 @@ replaced by a size picker, and results render inline in the conversation.
 
 ## Performance
 
-Measured live against Duck.ai on 2026-09-29:
+Measured live against Duck.ai (Railway deploy, 2026-11-13):
 
-| | Before | After |
+| Scenario | Before | After |
 |---|---|---|
-| First token (cold) | 10.2s | **5.5s** |
-| Per turn, session reuse | 10.3s | **~3s** |
+| First request after deploy | ~16s | **~6s** (prewarm) |
+| Fresh prompt (new conversation) | ~10.5s | **~2.7s** |
+| Streaming first token | ~5.5s | **~2.7s** |
+| Continuation (session reuse) | ~3s | **~2.5s** |
 
-Two changes get you there. **Warmup** polls until the page is genuinely ready
-instead of sleeping a fixed 7s, so a fast page skips straight ahead. **Session
-reuse** keeps the Duck.ai conversation alive and types only the delta of your
-prompt rather than the whole flattened transcript — which is also why the
-12,000-character composer cap is rarely hit in practice.
+Three mechanisms get you there:
 
-Set `DUCKAI_PREWARM=1` to move browser startup into server boot, so the very
-first caller skips the ~10s setup too.
+1. **Warmup polling** — the page is probed for readiness instead of sleeping a
+   fixed 7s, so a fast page skips straight ahead.
+2. **Session reuse** — when a request continues the previous conversation, only
+   the delta is typed into the live page (the 2.5× speedup).
+3. **Hot standby tab** (`DUCKAI_STANDBY=1`, default) — a fully-warmed spare tab
+   is always ready. Fresh-prompt requests — the path session reuse can't help,
+   since a new conversation needs a new page — take it instantly while a
+   replacement warms in the background during the current stream. This is what
+   collapsed the fresh-prompt path from ~10.5s to ~2.7s. Costs one extra Chrome
+   tab (~100-150MB); set `DUCKAI_STANDBY=0` on memory-tight plans.
+
+`DUCKAI_PREWARM` (default on) moves browser startup into server boot, so even
+the first caller skips the ~10s setup. The remaining ~2.5-3s is Duck.ai's own
+challenge/token minting and model latency — not relay overhead.
 
 ---
 

@@ -45,8 +45,11 @@ COPY main.py duckai.py dashboard.py dashboard.html tools.py toolrouter.py ./
 
 # The container runs as root (Railway's default), so duckai.py auto-adds
 # --no-sandbox; the env var makes it explicit and works for non-root runs too.
+# PREWARM=1 + STANDBY=1 (default): boot warms a tab and a hot spare stays ready,
+# so even the first request and every fresh-prompt send skip the challenge wait.
 ENV DUCKAI_CHROME_NO_SANDBOX=1 \
-    DUCKAI_PREWARM=0 \
+    DUCKAI_PREWARM=1 \
+    DUCKAI_STANDBY=1 \
     PORT=8080
 
 # run.py is the local convenience entry (venv + dashboard open); in a container

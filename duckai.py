@@ -340,6 +340,14 @@ WARM_MAX = float(os.getenv("DUCKAI_WARM_MAX", "7.0"))
 # Set to 0 to boot lazy (no browser until someone actually asks).
 PREWARM = os.getenv("DUCKAI_PREWARM", "1") not in ("0", "false", "False")
 
+# Keep a fully-warmed spare tab ready at all times. A fresh-prompt request
+# (anything that is not a continuation) must otherwise open a page and pay the
+# 2-7s challenge warm BEFORE the first token can move; taking an already-warm
+# standby cuts that to ~0, and a replacement warms in the background while the
+# current request streams. Costs one extra Chrome tab (~100-150MB) - set
+# DUCKAI_STANDBY=0 on memory-tight boxes.
+STANDBY = os.getenv("DUCKAI_STANDBY", "1") not in ("0", "false", "False")
+
 
 def _clamp_prompt(prompt: str, limit: int) -> str:
     """Trim an over-long prompt to `limit`, keeping the head (system preamble)
@@ -372,6 +380,10 @@ class _BrowserSession:
         # The reused page holds live conversation state, so only one send may drive
         # it at a time; concurrent clients queue instead of clobbering each other.
         self._lock = asyncio.Lock()
+        # Hot spare: a fully-warmed tab taken instantly by the next fresh-prompt
+        # request, refilled in the background while that request streams.
+        self._standby_page = None
+        self._standby_task: Optional[asyncio.Task] = None
 
     async def _ensure_ready(self) -> None:
         if self._ready:
@@ -407,6 +419,9 @@ class _BrowserSession:
                 pass
             self.page = None
         self._last_prompt = None
+        # Page dropped -> nothing warm for the next fresh send; refill now so
+        # even a cold path only waits for one warm cycle, not the next two.
+        self._refill_standby()
 
     async def _reset(self) -> None:
         """Tear the whole browser down after a transport-level failure so the
@@ -437,15 +452,41 @@ class _BrowserSession:
         We poll for readiness instead of sleeping the full 7s: the challenge
         token is ready well before 7s on a warm connection, so a ready-check
         cuts the common case to ~2s while the deadline still guards slow ones.
+
+        Takes the hot standby tab when available (zero-wait) and schedules a
+        replacement warm in the background.
         """
         await self._ensure_ready()
-        page = await self.ctx.new_page()
-        await page.goto(BASE, wait_until="domcontentloaded", timeout=60000)
-        self._page_opened_at = asyncio.get_event_loop().time()
-        await self._wait_warm(page)
+        if self._standby_page is not None:
+            page, self._standby_page = self._standby_page, None
+            self._page_opened_at = asyncio.get_event_loop().time()
+        else:
+            page = await self.ctx.new_page()
+            await page.goto(BASE, wait_until="domcontentloaded", timeout=60000)
+            self._page_opened_at = asyncio.get_event_loop().time()
+            await self._wait_warm(page)
         self.page = page
         self._last_prompt = None
+        self._refill_standby()
         return page
+
+    async def _warm_standby(self) -> None:
+        """Warm one spare tab into _standby_page (best-effort, never raises)."""
+        if self._pw is None or self._standby_page is not None:
+            return
+        try:
+            page = await self.ctx.new_page()
+            await page.goto(BASE, wait_until="domcontentloaded", timeout=60000)
+            await self._wait_warm(page)
+            self._standby_page = page
+        except Exception as e:  # noqa: BLE001 - standby is pure optimization
+            logger.warning("standby warm skipped: %s", e)
+
+    def _refill_standby(self) -> None:
+        if not STANDBY or self._pw is None:
+            return
+        if self._standby_task is None or self._standby_task.done():
+            self._standby_task = asyncio.get_event_loop().create_task(self._warm_standby())
 
     async def _wait_warm(self, page, budget: float = 7.0) -> None:
         """Block until the page looks ready to send, capped at `budget` seconds.
@@ -501,7 +542,7 @@ class _BrowserSession:
             prompt = _clamp_prompt(prompt, limit)
         await ta.click()
         await ta.fill(prompt)
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(150)
         sent = False
         for btn in await page.query_selector_all("button"):
             t = (await btn.inner_text() or "").strip()
@@ -632,7 +673,9 @@ class _BrowserSession:
                     raise DuckAIError("Duck.ai closed the stream without a reply")
                 self._last_prompt = prompt
                 return
-            await page.wait_for_timeout(200 if saw_data else 500)
+            # 150ms floor: stream chunks land between polls; 500ms pre-first-byte
+            # was pure added latency once the standby tab made sends near-instant.
+            await page.wait_for_timeout(150 if saw_data else 300)
         await self._drop_page()
         raise DuckAIError("timed out waiting for Duck.ai reply")
 
@@ -735,6 +778,14 @@ class _BrowserSession:
         raise DuckAIError(f"Duck.ai error: {typ}")
 
     async def close(self) -> None:
+        if self._standby_task is not None:
+            self._standby_task.cancel()
+        if self._standby_page is not None:
+            try:
+                await self._standby_page.close()
+            except Exception:
+                pass
+            self._standby_page = None
         try:
             if self.browser:
                 await self.browser.close()
@@ -800,7 +851,8 @@ class DuckAISession:
         Launching Chrome and warming a page costs ~10s, and _iter_events drops
         and re-warms a page on most turns, so an unwarmed server makes the very
         first caller wait for the full cost. Called once from app startup: the
-        first request then finds a live, already-warmed page.
+        first request then finds a live, already-warmed page - and with STANDBY
+        on, a second hot tab behind it for the next fresh-prompt request.
 
         Best-effort - a failure here must not stop the server booting, because
         the lazy path in _session_for still works.

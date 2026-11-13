@@ -710,17 +710,33 @@ class _BrowserSession:
         otherwise opens a fresh warmed page and re-sends the full flattened prompt
         (Duck.ai is a one-textarea chat; history must arrive in the body).
         `attachments` ({data, mime} list) rides the app's own file-upload path.
+
+        A dead-page error (browser OOM-killed the standby tab, context closed)
+        retries ONCE via a full _reset - the tab is gone either way, so the
+        second attempt rebuilds the browser from scratch and serves the turn.
+        Retry only happens pre-first-token: after that the client already has
+        partial output and a re-send would duplicate it.
         """
-        for attempt in (0, 1):
+        yielded_any = False
+        for attempt in (0, 1, 2):
             try:
                 async with self._lock:
                     async for ev in self._iter_events(prompt, timeout, rewrite, attachments):
                         msg = ev.get("message")
                         if msg:
+                            yielded_any = True
                             yield msg
                 return
             except _RewriteRejected:
-                if attempt == 0 and rewrite:
+                if attempt < 2 and rewrite:
+                    continue
+                raise
+            except Exception as e:
+                dead_transport = ("Target page, context or browser has been closed" in str(e)
+                                  or "browser transport" in str(e))
+                if attempt < 2 and dead_transport and not yielded_any:
+                    logger.warning("dead page/transport (%s); full reset and retry", e)
+                    await self._reset()
                     continue
                 raise
 
@@ -895,7 +911,7 @@ class DuckAISession:
         except Exception as e:
             logger.warning("prewarm failed (%s); serving lazily instead", e)
 
-    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2,
+    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 3,
                    attachments: Optional[List[dict]] = None) -> str:
         last_err: Optional[Exception] = None
         for _ in range(max(1, max_rotations)):
@@ -910,9 +926,17 @@ class DuckAISession:
                 continue
             except DuckAIError:
                 raise
-            except Exception as e:  # playwright transport died - rebuild, surface as 502
+            except Exception as e:
+                # Playwright transport died (browser OOM-killed, context closed).
+                # Rebuild in-loop and RETRY the same request once: the caller
+                # paid for the answer, and a rebuilt browser will serve it -
+                # surfacing a 502 here just moved the crash to the client.
+                logger.warning("browser transport died (%s); rebuilding and retrying", e)
                 await self._sessions[idx]._reset()
-                raise DuckAIError(f"browser transport failed: {e}")
+                try:
+                    return await (await self._session_for(idx)).send_ui(prompt, self.timeout, rewrite, attachments)
+                except Exception as e2:
+                    raise DuckAIError(f"browser transport failed after rebuild: {e2}")
         raise last_err or DuckAIRateLimit("all sessions failed")
 
     async def send_stream(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2,
@@ -923,8 +947,10 @@ class DuckAISession:
             idx = self._next_proxy_index()
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
+            saw_token = False
             try:
                 async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite, attachments):
+                    saw_token = True
                     yield tok
                 return
             except DuckAIRateLimit as e:
@@ -934,8 +960,23 @@ class DuckAISession:
             except DuckAIError:
                 raise
             except Exception as e:
+                # Same rebuild-and-retry contract as send(): a dead transport
+                # must cost the caller one clean retry, not a hard 502. Only
+                # safe pre-first-token: once tokens flowed the client already
+                # got a partial stream, so re-sending would duplicate output.
+                if saw_token:
+                    raise DuckAIError(f"browser transport failed mid-stream: {e}")
+                logger.warning("browser transport died (%s); rebuilding and retrying", e)
                 await self._sessions[idx]._reset()
-                raise DuckAIError(f"browser transport failed: {e}")
+                try:
+                    async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite, attachments):
+                        saw_token = True
+                        yield tok
+                    return
+                except Exception as e2:
+                    if saw_token:
+                        raise DuckAIError(f"browser transport failed mid-stream: {e2}")
+                    raise DuckAIError(f"browser transport failed after rebuild: {e2}")
         raise last_err or DuckAIRateLimit("all sessions failed")
 
     async def send_image(self, prompt: str, size: Optional[str] = None, max_rotations: int = 2) -> dict:

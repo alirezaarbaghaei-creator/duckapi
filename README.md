@@ -94,7 +94,58 @@ supported API, use a provider that offers one.
 
 ---
 
-## Installation
+## Deploy to Railway
+
+The repo ships a `Dockerfile` and `railway.json` — Railway builds the container,
+installs real Google Chrome inside it, and routes traffic to `/health`.
+
+### Steps
+
+1. Push this repo to GitHub (already done if you're reading it there).
+2. On [railway.com](https://railway.com) click **New Project → Deploy from GitHub repo**
+   and pick this repo. Railway auto-detects the Dockerfile — no config needed.
+3. In the service's **Variables** tab, add at minimum:
+
+   | Variable | Value | Why |
+   |---|---|---|
+   | `DUCKAI_API_KEY` | a long random string | **Required.** The service is public on the internet; without a key anyone can use your instance and burn your IP |
+   | `DUCKAI_PROXIES` | optional proxy pool | Railway's datacenter IPs get banned by Duck.ai fast — a residential proxy is near-mandatory for reliable use |
+
+4. Generate a public domain: **Settings → Networking → Generate Domain**.
+   Your API base is then `https://<your-domain>.up.railway.app/v1`.
+
+### What the container does
+
+- Runs `uvicorn main:app` bound to Railway's injected `$PORT` (no `run.py` — the
+  venv/bootstrap steps are for local machines only).
+- Uses `/usr/bin/google-chrome-stable` (real Chrome; the bundled Chromium gets
+  `ERR_BN_LIMIT` on first contact) with `--no-sandbox` + `--disable-dev-shm-usage`.
+- The dashboard's Stop button is disabled by default (`DUCKAI_ALLOW_SHUTDOWN` is
+  not set): Railway would just restart a killed container.
+- Prewarm is off (`DUCKAI_PREWARM=0`): the first request pays ~10s of browser
+  warmup, subsequent ones reuse the session.
+
+### Test it
+
+```bash
+curl https://<your-domain>.up.railway.app/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DUCKAI_API_KEY" \
+  -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Say PONG"}]}'
+```
+
+### Limits to know
+
+- **Ban risk is real.** Railway egress IPs are datacenter IPs — Duck.ai bans
+  them readily. Set `DUCKAI_PROXIES` (residential/SOCKS5 work best).
+- **The in-memory image cache and sessions die on redeploy** — that's inherent
+  to a browser-driven relay; the session rebuilds on the next request.
+- Railway's free/trial plan has limited RAM; one Chrome per used model is the
+  norm, so keep the model count small on small plans.
+
+---
+
+## Installation (local)
 
 ### 1. Clone and set up
 
@@ -183,6 +234,8 @@ All variables live in `.env`. Copy from `example.env` — it documents each one.
 | `DUCKAI_WARM_MAX` | `7.0` | Deadline for the readiness poll |
 | `DUCKAI_PREWARM` | `1` | Warm a browser at startup instead of on first request |
 | `DUCKAI_CHROME_PATH` | *(auto)* | Override the Chrome binary |
+| `DUCKAI_CHROME_NO_SANDBOX` | *(empty)* | `1` = launch Chrome with `--no-sandbox` (containers; Dockerfile sets it) |
+| `DUCKAI_ALLOW_SHUTDOWN` | *(empty)* | `1` = enable `/api/shutdown` (local use; managed hosts should leave it off) |
 | `DUCKAI_MODEL` | `gpt-5.6-luna` | Default model when the client omits one |
 | `DUCKAI_NEW_CHAT` | `0` | `0` reuses the session (fast); `1` forces a fresh chat per request |
 | `DUCKAI_TOOL_ROUTING` | `0` | Experimental intent→tool synthesis. **Off** — see below |
@@ -420,6 +473,8 @@ duckapi/
 ├── dashboard.html    # the UI — no build step
 ├── tools.py          # tool-call extraction
 ├── toolrouter.py     # experimental intent→tool synthesis
+├── Dockerfile        # Railway/Docker image (real Chrome inside)
+├── railway.json      # Railway build/deploy config
 ├── example.env       # documented config template
 └── requirements.txt
 ```

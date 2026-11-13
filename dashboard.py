@@ -97,12 +97,14 @@ async def index():
 
 @router.get("/api/status")
 async def status():
+    import os
     import main
     pools = _sessions()
     return {
         "uptime_s": round(time.time() - main._BOOT_TS, 1),
         "port": main.PORT,
         "auth_required": bool(main.API_KEY),
+        "shutdown_allowed": os.getenv("DUCKAI_ALLOW_SHUTDOWN", "").strip() == "1",
         "config": {
             "default_model": main.DEFAULT,
             "new_chat": main.NEW_CHAT,
@@ -238,13 +240,21 @@ async def shutdown(request: Request):
     """Stop this server. Only works while it's serving this page - which is the
     point: a dead server has no button either.
 
+    Disabled when DUCKAI_ALLOW_SHUTDOWN != "1": on a managed host (Railway,
+    Docker, Fly.io) the platform owns the process lifecycle and its health
+    check would just restart what this button kills, burning prewarm time.
+    The UI reads the flag from /api/status and hides the button.
+
     Delegates to main._drain_then_exit(), which waits for in-flight requests,
     closes the browsers, and exits. It does not signal our own PID: run.py
     spawns uvicorn as a child process so there is no Server instance to ask for
     should_exit, and on Windows os.kill(pid, SIGINT) is TerminateProcess rather
     than a catchable signal - it would skip the shutdown hook and orphan Chrome.
     """
+    import os
     import main
+    if os.getenv("DUCKAI_ALLOW_SHUTDOWN", "").strip() != "1":
+        raise HTTPException(status_code=403, detail="shutdown disabled (set DUCKAI_ALLOW_SHUTDOWN=1 to enable)")
     request.app.state._stopping = True
     # Deferred: this response must flush before the process goes away.
     asyncio.get_running_loop().call_later(0.25, asyncio.create_task, main._drain_then_exit())

@@ -468,6 +468,9 @@ async function loadStatus() {
   $('s-up').textContent = dur(d.uptime_s);
   $('s-port').textContent = d.port;
   $('s-auth').textContent = d.auth_required ? 'API key required' : 'open';
+  // The Stop button kills the process; on managed hosts (Railway, Docker) the
+  // platform just restarts it, so hide the button unless shutdown is enabled.
+  $('stop').style.display = d.shutdown_allowed ? '' : 'none';
   $('s-model').textContent = d.config.default_model;
   $('s-nc').textContent = d.config.new_chat ? 'always fresh' : 'reuse session';
   $('s-wmin').textContent = d.warm.min_s + 's';

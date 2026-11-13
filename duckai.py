@@ -54,8 +54,22 @@ from playwright.async_api import async_playwright
 logger = logging.getLogger("duckai")
 
 BASE = os.getenv("DUCKAI_BASE", "https://duck.ai")
+
+
+def _default_chrome_path() -> str:
+    """Chrome binary per platform. Playwright's bundled Chromium is fingerprinted
+    and hard-banned by Duck.ai, so we always drive a REAL Chrome install."""
+    if os.name == "nt":
+        return r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    # Linux (containers incl. Railway/Docker): the google-chrome-stable package.
+    for cand in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"):
+        if os.path.exists(cand):
+            return cand
+    return "/usr/bin/google-chrome"
+
+
 # Use the system Chrome, not Playwright's bundled Chromium (fingerprint reasons above).
-CHROME_PATH = os.getenv("DUCKAI_CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+CHROME_PATH = os.getenv("DUCKAI_CHROME_PATH", "") or _default_chrome_path()
 # A real desktop Chrome UA (no "HeadlessChrome" marker). Version pinned to a common
 # stable release; must NOT contain "HeadlessChrome".
 REAL_UA = (
@@ -364,7 +378,18 @@ class _BrowserSession:
         launch: dict = {"headless": True, "channel": "chrome"}
         if CHROME_PATH and os.path.exists(CHROME_PATH):
             launch["executable_path"] = CHROME_PATH
-        launch["args"] = ["--disable-blink-features=AutomationControlled"]
+        args = ["--disable-blink-features=AutomationControlled"]
+        if os.name == "posix":
+            # Container survival: small /dev/shm (the Docker default, 64M) makes
+            # Chrome tab-render crash mid-stream; this flag routes around it.
+            args.append("--disable-dev-shm-usage")
+            # Chrome's setuid sandbox does not exist in most containers. Force
+            # --no-sandbox when the deploy opted in (Dockerfile sets it) or when
+            # we actually run as root - otherwise the browser never launches.
+            if (os.getenv("DUCKAI_CHROME_NO_SANDBOX", "").strip() == "1"
+                    or (hasattr(os, "geteuid") and os.geteuid() == 0)):
+                args.append("--no-sandbox")
+        launch["args"] = args
         if self.proxy:
             launch["proxy"] = _normalize_proxy(self.proxy)
         self.browser = await self._pw.chromium.launch(**launch)

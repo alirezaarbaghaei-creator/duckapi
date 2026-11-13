@@ -1,0 +1,17 @@
+# Keep the build context small and secrets out of the image.
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.env
+server.log
+*.log
+.DS_Store
+Thumbs.db
+# Local-only helpers; the container runs uvicorn directly.
+run.py
+example.env
+README.md
+LICENSE

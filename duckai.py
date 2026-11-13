@@ -354,8 +354,12 @@ PREWARM = os.getenv("DUCKAI_PREWARM", "1") not in ("0", "false", "False")
 # DUCKAI_STANDBY=0 on memory-tight boxes.
 STANDBY = os.getenv("DUCKAI_STANDBY", "1") not in ("0", "false", "False")
 # Number of hot spares. Two keeps back-to-back fresh prompts (client retries,
-# parallel IDE calls) off the cold path entirely.
-STANDBY_COUNT = int(os.getenv("DUCKAI_STANDBY_COUNT", "2"))
+# parallel IDE calls) off the cold path entirely - BUT every model with a
+# session runs its own browser, so RAM scales as models x (tabs + spares).
+# Railway's small plans OOM-kill Chrome at 3 browsers x 2 spares ("Target
+# crashed"), so default to ONE spare; raise to 2 only on fat single-model
+# deployments.
+STANDBY_COUNT = int(os.getenv("DUCKAI_STANDBY_COUNT", "1"))
 
 
 def _clamp_prompt(prompt: str, limit: int) -> str:

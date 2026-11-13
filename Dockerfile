@@ -50,6 +50,7 @@ COPY main.py duckai.py dashboard.py dashboard.html tools.py toolrouter.py ./
 ENV DUCKAI_CHROME_NO_SANDBOX=1 \
     DUCKAI_PREWARM=1 \
     DUCKAI_STANDBY=1 \
+    DUCKAI_STANDBY_COUNT=1 \
     PORT=8080
 
 # run.py is the local convenience entry (venv + dashboard open); in a container

@@ -409,27 +409,33 @@ Measured live against Duck.ai (Railway deploy, 2026-11-13):
 
 | Scenario | Before | After |
 |---|---|---|
-| First request after deploy | ~16s | **~6s** (prewarm) |
-| Fresh prompt (new conversation) | ~10.5s | **~2.7s** |
+| First request after deploy | ~16s | **~5s** (prewarm) |
+| Fresh prompt (new conversation) | ~10.5s | **~2.8s** |
 | Streaming first token | ~5.5s | **~2.7s** |
 | Continuation (session reuse) | ~3s | **~2.5s** |
 
-Three mechanisms get you there:
+Four mechanisms get you there:
 
 1. **Warmup polling** — the page is probed for readiness instead of sleeping a
-   fixed 7s, so a fast page skips straight ahead.
+   fixed 7s. Live probes showed sends succeed at 1.5s page age (the textarea
+   only renders once the challenge JS is up), so `DUCKAI_WARM_MIN` defaults to
+   1.0s.
 2. **Session reuse** — when a request continues the previous conversation, only
-   the delta is typed into the live page (the 2.5× speedup).
+   the delta is typed into the live page.
 3. **Hot standby tab** (`DUCKAI_STANDBY=1`, default) — a fully-warmed spare tab
-   is always ready. Fresh-prompt requests — the path session reuse can't help,
-   since a new conversation needs a new page — take it instantly while a
-   replacement warms in the background during the current stream. This is what
-   collapsed the fresh-prompt path from ~10.5s to ~2.7s. Costs one extra Chrome
-   tab (~100-150MB); set `DUCKAI_STANDBY=0` on memory-tight plans.
+   is always ready. Fresh-prompt requests — the path session reuse can't help —
+   take it instantly while a replacement warms in the background during the
+   current stream. This collapsed the fresh-prompt path from ~10.5s to ~2.8s.
+4. **Rebuild-and-retry** — if the container's Chrome is ever OOM-killed, the
+   in-flight request rebuilds the browser and retries once instead of 502-ing.
 
-`DUCKAI_PREWARM` (default on) moves browser startup into server boot, so even
-the first caller skips the ~10s setup. The remaining ~2.5-3s is Duck.ai's own
-challenge/token minting and model latency — not relay overhead.
+**RAM budget:** memory scales as *models used × (1 + `DUCKAI_STANDBY_COUNT`)*
+Chrome tabs. Three models × one spare = 6 tabs — that is the ceiling for small
+Railway plans; above it Chrome gets OOM-killed (`Target crashed` in the logs).
+Set `DUCKAI_STANDBY_COUNT=2` only when one model serves all traffic.
+
+The remaining ~2.5-3s is Duck.ai's own challenge/token minting and model
+latency — not relay overhead.
 
 ---
 

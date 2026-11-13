@@ -40,6 +40,7 @@ from uuid import uuid4
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from duckai import (
@@ -330,6 +331,21 @@ def build_anthropic_prompt(system: Any, messages: List[dict]) -> str:
 # App + session
 # ---------------------------------------------------------------------------
 app = FastAPI(title="DuckAI2API")
+
+# CORS: browser-based clients (Z.ai, Chatbox web, LobeChat web, LibreChat...)
+# call this API straight from the page. Without preflight answers the browser
+# blocks every request before it leaves the page, which the client reports as
+# an opaque "model request failed". Allow all origins - the API key is the
+# actual gate, CORS is not a security boundary here. Streaming responses need
+# expose_headers so clients can read the SSE metadata headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Api-Key", "X-Request-Id"],
+    expose_headers=["Content-Type"],
+)
 
 import dashboard  # noqa: E402  - dashboard reads main's globals, so import after them
 app.include_router(dashboard.router)

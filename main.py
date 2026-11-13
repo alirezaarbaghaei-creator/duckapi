@@ -539,6 +539,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     tools: Optional[List[dict]] = None
     reasoning_effort: Optional[str] = None
+    stream_options: Optional[dict] = None
     duckai: Optional[dict] = None
 
 
@@ -1096,6 +1097,19 @@ async def images_content(img_id: str, request: Request,
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# Clients probe the server root before trusting it (Z.ai validated its provider
+# config with GET /v1 and marked the model failed on the 404). Return the same
+# shape as OpenAI's api.openai.com/v1 so "base URL + /chat/completions" and
+# "base URL" both configure correctly in any client.
+@app.get("/v1")
+async def v1_root():
+    return {
+        "object": "list",
+        "data": [],  # OpenAI returns its 4 fixed paths here; clients only check reachability
+        "detail": "DuckAI2API - OpenAI-compatible relay. POST /v1/chat/completions, GET /v1/models",
+    }
 
 
 if __name__ == "__main__":

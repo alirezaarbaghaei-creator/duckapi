@@ -462,6 +462,33 @@ async def _prewarm_default_model() -> None:
     except Exception as e:  # never block boot on a warmup problem
         logger.warning("startup prewarm skipped: %s", e)
 
+    # Session watchdog: every 5 minutes, verify each pooled browser is still
+    # alive and reset the dead ones. Overnight (no traffic) a Chrome renderer
+    # crash or OOM kill leaves a zombie whose children accumulate - the next
+    # fork fails with EAGAIN and the server 502s until manually restarted.
+    # Probing closes that loop: a dead session is rebuilt proactively.
+    async def _watchdog() -> None:
+        while True:
+            await asyncio.sleep(300)
+            for model, pool in list(_sessions.items()):
+                for idx, s in list(pool._sessions.items()):
+                    if not s._ready:
+                        continue
+                    try:
+                        # Cheap liveness probe against the running event loop.
+                        probe = await s._ensure_ready()
+                        if s.ctx is not None:
+                            p = await s.ctx.new_page()
+                            await p.close()
+                    except Exception as e:
+                        logger.warning("watchdog: session %s[%d] dead (%s); resetting", model, idx, e)
+                        try:
+                            await s._reset()
+                        except Exception as e2:
+                            logger.error("watchdog: reset of %s[%d] failed: %s", model, idx, e2)
+
+    asyncio.create_task(_watchdog())
+
 
 @app.on_event("shutdown")
 async def _close_sessions() -> None:

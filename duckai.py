@@ -399,10 +399,20 @@ class _BrowserSession:
         # from ever falling back to the cold open+warm path.
         self._standby_pages: List[Any] = []
         self._standby_tasks: List[asyncio.Task] = []
+        # Set by a failed standby refill when the context itself is dead; the
+        # next _ensure_ready honours it and rebuilds the whole transport.
+        self._reset_needed = False
 
     async def _ensure_ready(self) -> None:
         if self._ready:
-            return
+            # A failed standby refill can flag the transport dead while
+            # _ready is still True; honour the flag instead of serving from
+            # a zombie browser forever (the overnight-EAGAIN failure mode).
+            if self._reset_needed:
+                self._ready = False
+                await self._reset()
+            else:
+                return
         self._pw = await async_playwright().start()
         launch: dict = {"headless": True, "channel": "chrome"}
         if CHROME_PATH and os.path.exists(CHROME_PATH):
@@ -443,6 +453,17 @@ class _BrowserSession:
         next request rebuilds from scratch (dead browser/ctx would otherwise
         make every later call throw)."""
         await self._drop_page()
+        # Drop any warm spares too: they live in the dying context, and their
+        # Chrome renderers must be reaped or fork-EAGAIN compounds overnight.
+        for p in self._standby_pages:
+            try:
+                await p.close()
+            except Exception:
+                pass
+        self._standby_pages = []
+        for t in self._standby_tasks:
+            t.cancel()
+        self._standby_tasks = []
         try:
             if self.browser:
                 await self.browser.close()
@@ -457,6 +478,7 @@ class _BrowserSession:
         self.ctx = None
         self._pw = None
         self._ready = False
+        self._reset_needed = False
 
     async def _open_warmed_page(self):
         """Open a fresh page and warm it so the app mints its challenge/token JS.
@@ -489,6 +511,7 @@ class _BrowserSession:
         """Warm one spare tab onto _standby_pages (best-effort, never raises)."""
         if self._pw is None:
             return
+        page = None
         try:
             page = await self.ctx.new_page()
             await page.goto(BASE, wait_until="domcontentloaded", timeout=60000)
@@ -499,6 +522,22 @@ class _BrowserSession:
             self._standby_pages.append(page)
         except Exception as e:  # noqa: BLE001 - standby is pure optimization
             logger.warning("standby warm skipped: %s", e)
+            # A half-opened tab would leak a Chrome renderer on every failed
+            # refill; overnight that compounds into fork-EAGAIN (EADDR across
+            # hundreds of zombie children). Close it, and if the CONTEXT died,
+            # tear the whole transport down so the next request rebuilds clean.
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if self.ctx is not None:
+                try:
+                    probe = await self.ctx.new_page()
+                    await probe.close()
+                except Exception:
+                    logger.warning("standby: context dead after warm failure; scheduling reset")
+                    self._reset_needed = True
 
     def _refill_standby(self) -> None:
         if not STANDBY or self._pw is None:

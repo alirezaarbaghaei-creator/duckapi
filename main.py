@@ -101,6 +101,9 @@ NEW_CHAT = os.getenv("DUCKAI_NEW_CHAT", "0").strip() == "1"
 # the IDE reports "no response from model"). Off by default; opt in per deploy.
 TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
 PORT = int(os.getenv("PORT", "8080"))
+# Browser-per-model RAM guard: each session is one full Chrome (~150-300MB).
+# Small Railway plans OOM-crash above ~3; fat boxes can raise via env.
+MAX_BROWSERS = int(os.getenv("DUCKAI_MAX_BROWSERS", "3"))
 _BOOT_TS = time.time()
 _active_requests = 0
 
@@ -429,7 +432,17 @@ app.add_middleware(_ActiveRequestTracker)
 async def get_session(model: str) -> DuckAISession:
     global _sessions
     if model not in _sessions:
+        # Browser-per-model: each used model spawns a whole Chrome. RAM scales
+        # hard, and small containers (Railway starter plans) OOM-crash Chrome
+        # ("Page crashed") once several models accumulate - taking every other
+        # model down with them. LRU-evict the oldest session past the cap.
+        if len(_sessions) >= MAX_BROWSERS:
+            oldest = min(_sessions.values(), key=lambda s: s.last_used)
+            logger.info("RAM guard: evicting session %s (cap %d browsers)", oldest.model, MAX_BROWSERS)
+            await oldest.close()
+            _sessions.pop(oldest.model, None)
         _sessions[model] = DuckAISession(model=model, proxies=PROXIES, new_chat=NEW_CHAT)
+    _sessions[model].last_used = time.time()
     return _sessions[model]
 
 

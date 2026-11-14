@@ -861,6 +861,8 @@ class DuckAISession:
         self.model = model
         self.timeout = timeout
         self.new_chat = new_chat
+        # LRU bookkeeping (main.get_session RAM guard); 0.0 = never used.
+        self.last_used = 0.0
         if not proxies:
             self.proxies: List[Optional[str]] = [None]
         elif isinstance(proxies, str):

@@ -102,8 +102,10 @@ NEW_CHAT = os.getenv("DUCKAI_NEW_CHAT", "0").strip() == "1"
 TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
 PORT = int(os.getenv("PORT", "8080"))
 # Browser-per-model RAM guard: each session is one full Chrome (~150-300MB).
-# Small Railway plans OOM-crash above ~3; fat boxes can raise via env.
-MAX_BROWSERS = int(os.getenv("DUCKAI_MAX_BROWSERS", "3"))
+# Railway-starter-sized containers OOM-crash even at 3 (production evidence:
+# 'Page crashed'/'Target crashed'); 2 with a standby tab each is the ceiling
+# there. Fat boxes can raise via env.
+MAX_BROWSERS = int(os.getenv("DUCKAI_MAX_BROWSERS", "2"))
 _BOOT_TS = time.time()
 _active_requests = 0
 
